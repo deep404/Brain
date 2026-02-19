@@ -43,6 +43,11 @@ import time
 import os
 import psutil
 
+import multiprocessing as mp
+# Brain code keeps thread locks / open files inside Process objects -> needs fork (no pickling)
+if "fork" in mp.get_all_start_methods():
+    mp.set_start_method("fork", force = True)
+
 # Pin to CPU cores 0–3
 available_cores = list(range(psutil.cpu_count()))
 psutil.Process(os.getpid()).cpu_affinity(available_cores)
@@ -58,18 +63,19 @@ logging.basicConfig(level=logging.INFO)
 
 # ===================================== PROCESS IMPORTS ==================================
 
-from src.gateway.processGateway import processGateway
-from src.dashboard.processDashboard import processDashboard
-from src.hardware.camera.processCamera import processCamera
-from src.hardware.serialhandler.processSerialHandler import processSerialHandler
-from src.data.Semaphores.processSemaphores import processSemaphores
-from src.data.TrafficCommunication.processTrafficCommunication import processTrafficCommunication
+from src.gateway.processGateway import processGateway as ProcessGateway
+from src.dashboard.processDashboard import processDashboard as ProcessDashboard
+from src.hardware.camera.processCamera import processCamera as ProcessCamera
+from src.hardware.serialhandler.processSerialHandler import processSerialHandler as ProcessSerialHandler
+from src.data.Semaphores.processSemaphores import processSemaphores as ProcessSemaphores
+from src.data.TrafficCommunication.processTrafficCommunication import processTrafficCommunication as ProcessTrafficCommunication
 from src.utils.messages.messageHandlerSubscriber import messageHandlerSubscriber
 from src.utils.messages.allMessages import StateChange
 from src.statemachine.stateMachine import StateMachine
 from src.statemachine.systemMode import SystemMode
 
 # ------ New component imports starts here ------#
+from src.perception.trafficSignDetection.processTrafficSignDetection import processTrafficSignDetection
 
 
 # ------ New component imports ends here ------#
@@ -105,106 +111,142 @@ def manage_process_life(process_class, process_instance, process_args, enabled, 
     return process_instance 
 
 # ======================================== SETTING UP ====================================
+USE_LIVE_CAMERA = False   # True = picamera2, False = loop mp4
+VIDEO_PATH = "raw_data/bfmc2020_online_2.mp4"
 
-print(BigPrint.PLEASE_WAIT.value)
-allProcesses = list()
-allEvents = list()
+def _run():
+    global logging
+    print(BigPrint.PLEASE_WAIT.value)
+    allProcesses = list()
+    allEvents = list()
 
-queueList = {
-    "Critical": Queue(),
-    "Warning": Queue(),
-    "General": Queue(),
-    "Config": Queue(),
-    "Log": Queue(),
-}
-logging = logging.getLogger()
+    queueList = {
+        "Critical": Queue(),
+        "Warning": Queue(),
+        "General": Queue(),
+        "Config": Queue(),
+        "Log": Queue(),
+    }
+    logging = logging.getLogger()
 
-original_stdout = sys.stdout
-original_stderr = sys.stderr
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
 
-queue_writer = QueueWriter(queueList["Log"])
-sys.stdout = MultiWriter(original_stdout, queue_writer)
-sys.stderr = MultiWriter(original_stderr, queue_writer)
+    queue_writer = QueueWriter(queueList["Log"])
+    sys.stdout = MultiWriter(original_stdout, queue_writer)
+    sys.stderr = MultiWriter(original_stderr, queue_writer)
 
-# ===================================== INITIALIZE ==================================
+    # ===================================== INITIALIZE ==================================
 
-stateChangeSubscriber = messageHandlerSubscriber(queueList, StateChange, "lastOnly", True)
-StateMachine.initialize_shared_state(queueList)
+    stateChangeSubscriber = messageHandlerSubscriber(queueList, StateChange, "lastOnly", True)
+    StateMachine.initialize_shared_state(queueList)
 
-# Initializing gateway
-processGateway = processGateway(queueList, logging)
-processGateway.start()
+    # Initializing gateway
+    processGateway = ProcessGateway(queueList, logging)
+    processGateway.start()
 
-# ===================================== INITIALIZE PROCESSES ==================================
+    # ===================================== INITIALIZE PROCESSES ==================================
 
-# Initializing dashboard
-dashboard_ready = Event()
-processDashboard = processDashboard(queueList, logging, dashboard_ready, debugging = False)
+    # Initializing dashboard
+    dashboard_ready = Event()
+    processDashboard = ProcessDashboard(queueList, logging, dashboard_ready, debugging = False)
 
-# Initializing camera
-camera_ready = Event()
-processCamera = processCamera(queueList, logging, camera_ready, debugging = False)
+    # Initializing camera
+    camera_ready = Event()
+    processCamera = ProcessCamera(
+        queueList, logging, camera_ready, debugging=False,
+        use_live_camera=USE_LIVE_CAMERA,
+        video_path=VIDEO_PATH,
+        loop_video=True,
+        target_fps=20.0,
+    )
 
-# Initializing semaphores
-semaphore_ready = Event()
-processSemaphore = processSemaphores(queueList, logging, semaphore_ready, debugging = False)
+    # Initializing semaphores
+    semaphore_ready = Event()
+    processSemaphore = ProcessSemaphores(queueList, logging, semaphore_ready, debugging = False)
 
-# Initializing GPS
-traffic_com_ready = Event()
-processTrafficCom = processTrafficCommunication(queueList, logging, 3, traffic_com_ready, debugging = False)
+    # Initializing GPS
+    traffic_com_ready = Event()
+    processTrafficCom = ProcessTrafficCommunication(queueList, logging, 3, traffic_com_ready, debugging = False)
 
-# Initializing serial connection NUCLEO - > PI
-serial_handler_ready = Event()
-processSerialHandler = processSerialHandler(queueList, logging, serial_handler_ready, dashboard_ready, debugging = False)
+    # Initializing serial connection NUCLEO - > PI
+    serial_handler_ready = Event()
+    processSerialHandler = ProcessSerialHandler(queueList, logging, serial_handler_ready, dashboard_ready, debugging = False)
 
-# Adding all processes to the list
-allProcesses.extend([processCamera, processSemaphore, processTrafficCom, processSerialHandler, processDashboard])
-allEvents.extend([camera_ready, semaphore_ready, traffic_com_ready, serial_handler_ready, dashboard_ready])
+    # Adding all processes to the list
+    allProcesses.extend([processCamera, processSemaphore, processTrafficCom, processSerialHandler, processDashboard])
+    allEvents.extend([camera_ready, semaphore_ready, traffic_com_ready, serial_handler_ready, dashboard_ready])
 
-# ------ New component initialize starts here ------#
+    # ------ New component initialize starts here ------#
+    # Initializing traffic sign detection
+    tsd_ready = Event()
+    processTSD = processTrafficSignDetection(
+        queueList,
+        logging,
+        tsd_ready,
+        debugging=False,
+        weights_path="traffic-sign-detection-model/traffic-sign-yolo26n-bfmc.pt",  # adjust to your repo paths
+        input_message="mainCamera",  # or "serialCamera"
+        target_fps=10.0,              # can be lower (0.5 etc.)
+        conf=0.25,
+        imgsz=640,
+    )
+    allProcesses.append(processTSD)
+    allEvents.append(tsd_ready)
 
-# ------ New component initialize ends here ------#
 
-# ===================================== START PROCESSES ==================================
+    # ------ New component initialize ends here ------#
 
-for process in allProcesses:
-    process.daemon = True
-    process.start()
+    # ===================================== START PROCESSES ==================================
 
-# ===================================== STAYING ALIVE ====================================
+    for process in allProcesses:
+        process.daemon = True
+        process.start()
 
-blocker = Event()
-try:
-    # wait for all events to be set
-    for event in allEvents:
-        event.wait()
+    # ===================================== STAYING ALIVE ====================================
 
-    # apply starting mode
-    StateMachine.initialize_starting_mode()
+    blocker = Event()
+    try:
+        # wait for all events to be set
+        for event in allEvents:
+            event.wait()
 
-    time.sleep(10)
-    print(BigPrint.C4_BOMB.value)
-    print(BigPrint.PRESS_CTRL_C.value)
+        # apply starting mode
+        StateMachine.initialize_starting_mode()
 
-    while True:
-        message = stateChangeSubscriber.receive()
-        if message is not None:
-            modeDictSemaphore = SystemMode[message].value["semaphore"]["process"]
-            modeDictTrafficCom = SystemMode[message].value["traffic_com"]["process"]
+        time.sleep(10)
+        print(BigPrint.C4_BOMB.value)
+        print(BigPrint.PRESS_CTRL_C.value)
 
-            processSemaphore = manage_process_life(processSemaphores, processSemaphore, [queueList, logging, semaphore_ready, False], modeDictSemaphore["enabled"], allProcesses)
-            processTrafficCom = manage_process_life(processTrafficCommunication, processTrafficCom, [queueList, logging, 3, traffic_com_ready, False], modeDictTrafficCom["enabled"], allProcesses)
+        while True:
+            message = stateChangeSubscriber.receive()
+            if message is not None:
+                modeDictSemaphore = SystemMode[message].value["semaphore"]["process"]
+                modeDictTrafficCom = SystemMode[message].value["traffic_com"]["process"]
 
-        blocker.wait(0.1)
+                processSemaphore = manage_process_life(ProcessSemaphores, processSemaphore, [queueList, logging, semaphore_ready, False], modeDictSemaphore["enabled"], allProcesses)
+                processTrafficCom = manage_process_life(ProcessTrafficCommunication, processTrafficCom, [queueList, logging, 3, traffic_com_ready, False], modeDictTrafficCom["enabled"], allProcesses)
 
-except KeyboardInterrupt:
-    print("\nCatching a KeyboardInterruption exception! Shutdown all processes.\n")
+            blocker.wait(0.1)
 
-    for proc in reversed(allProcesses):
-        proc.stop()
-    processGateway.stop()
+    except KeyboardInterrupt:
+        print("\nCatching a KeyboardInterruption exception! Shutdown all processes.\n")
 
-    # wait for all processes to finish before exiting
-    for proc in reversed(allProcesses):
-        shutdown_process(proc)
-    shutdown_process(processGateway)
+        for proc in reversed(allProcesses):
+            proc.stop()
+        processGateway.stop()
+
+        # wait for all processes to finish before exiting
+        for proc in reversed(allProcesses):
+            shutdown_process(proc)
+        shutdown_process(processGateway)
+
+if __name__ == "__main__":
+    import multiprocessing as mp
+    mp.freeze_support() # safe no-op on Linux; required on Windows style start methods
+    # Optional but recommended: match the older Linux behavior (what BFMC originally assumed)
+    try:
+        mp.set_start_method("fork")
+    except RuntimeError:
+        pass
+    _run()

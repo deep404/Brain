@@ -41,6 +41,18 @@ class serialCamera(Enum):
     msgID = 2
     msgType = "str"
 
+class TrafficSignCamera(Enum):
+    Queue = "General"
+    Owner = "threadTrafficSignDetection"
+    msgID = 42
+    msgType = "str"   # base64 jpeg (no header)
+
+class TrafficSignMask(Enum):
+    Queue = "General"
+    Owner = "TrafficSignDetection"   # match your process/thread Owner style
+    msgID = 43                    # pick an unused id
+    msgType = "str"                  # base64 string (PNG with alpha)
+
 class Recording(Enum):
     Queue = "General"
     Owner = "threadCamera"
