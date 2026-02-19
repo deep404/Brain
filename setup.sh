@@ -7,7 +7,7 @@ sudo apt-get upgrade -y
 sudo apt-get install -y \
   python3-pip python3-dev build-essential pkg-config \
   libgl1 libglib2.0-0 libssl-dev libffi-dev \
-  python3-libcamera xdg-utils curl ca-certificates
+  xdg-utils curl ca-certificates
 
 # --- Enable global pip installs --------------------------------------------
 sudo pip3 config --global set global.break-system-packages true
