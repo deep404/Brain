@@ -1,0 +1,24 @@
+{
+    "Header": {
+        "Comment": "All values are metric (mm)",
+        "CreationDate": "2025-06-19T07:16:52Z",
+        "GenerationSoftware": {
+            "Application": "EAGLE",
+            "Vendor": "Autodesk",
+            "Version": "9.6.2"
+        },
+        "Part": "Single"
+    },
+    "Overall": {
+        "BoardThickness": 1.386,
+        "LayerNumber": 6,
+        "Name": {
+            "ProjectId": "BFMC_Powerboard v0.2"
+        },
+        "Owner": "Andrei Kovari <andrei.kovari@nanolabs.ro>",
+        "Size": {
+            "X": 80,
+            "Y": 57
+        }
+    }
+}
