@@ -71,7 +71,7 @@ export class WebSocketService {
 
   constructor() {
     this.webSocket = new Socket({
-      url: "http://192.168.0.106:5005",
+      url: "http://172.20.222.232:5005",
       options: {},
     });
 
@@ -164,6 +164,14 @@ export class WebSocketService {
   // Method to receive image updates
   receiveCamera(): Observable<any> {
     return this.webSocket.fromEvent('serialCamera');
+  }
+
+  receiveTrafficSignCamera(): Observable<any> {
+    return this.webSocket.fromEvent('TrafficSignCamera') as Observable<any>;
+  }
+
+  receiveTrafficSignMask(): Observable<any> {
+    return this.webSocket.fromEvent('TrafficSignMask');
   }
 
   // Method to receive location updates
