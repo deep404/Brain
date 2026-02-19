@@ -338,7 +338,20 @@ class processDashboard(WorkerProcess):
         """Monitor and update hardware metrics periodically."""
         self.cpuCoreUsage = psutil.cpu_percent(interval=None, percpu=False)
         self.memoryUsage = psutil.virtual_memory().percent
-        self.cpuTemperature = round(psutil.sensors_temperatures()['cpu_thermal'][0].current)
+        temps = psutil.sensors_temperatures(fahrenheit=False) or {}
+        entry = None
+        for key in ("cpu_thermal", "coretemp", "k10temp", "acpitz"):
+            if key in temps and temps[key]:
+                entry = temps[key][0]
+                break
+        # fallback: take the first available sensor entry if any
+        if entry is None:
+            for entries in temps.values():
+                if entries:
+                    entry = entries[0]
+                    break
+        # If WSL / OS exposes no sensors, keep a safe default
+        self.cpuTemperature = round(entry.current) if entry is not None else 0
 
         eventlet.spawn_after(1, self.update_hardware_data)
 
