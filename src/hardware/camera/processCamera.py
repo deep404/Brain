@@ -48,13 +48,17 @@ class processCamera(WorkerProcess):
     """
 
     # ====================================== INIT ==========================================
-    def __init__(self, queueList, logging, ready_event=None, debugging=False):
+    def __init__(self, queueList, logging, ready_event=None, debugging=False, use_live_camera=True, video_path="raw_data/bfmc2020_online_2.mp4", loop_video=True, target_fps=20.0):
         self.queuesList = queueList
         self.logging = logging
         self.debugging = debugging
         self.stateChangeSubscriber = messageHandlerSubscriber(self.queuesList, StateChange, "lastOnly", True)
 
-        super(processCamera, self).__init__(self.queuesList, ready_event)
+        self.use_live_camera = use_live_camera
+        self.video_path = video_path
+        self.loop_video = loop_video
+        self.target_fps = target_fps
+        super().__init__(self.queuesList, ready_event)
 
     # ================================ STATE CHANGE HANDLER ========================================
     def state_change_handler(self):
@@ -69,12 +73,17 @@ class processCamera(WorkerProcess):
 
     # ===================================== INIT TH ======================================
     def _init_threads(self):
-        """Create the Camera Publisher thread and add to the list of threads."""
-        camTh = threadCamera(
-         self.queuesList, self.logging, self.debugging
+        self.threads.append(
+            threadCamera(
+                self.queuesList,
+                self.logging,
+                self.debugging,
+                use_live_camera=self.use_live_camera,
+                video_path=self.video_path,
+                loop_video=self.loop_video,
+                target_fps=self.target_fps,
+            )
         )
-        self.threads.append(camTh)
-
 
 # =================================== EXAMPLE =========================================
 #             ++    THIS WILL RUN ONLY IF YOU RUN THE CODE FROM HERE  ++
