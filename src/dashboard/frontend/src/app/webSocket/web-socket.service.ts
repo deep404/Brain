@@ -66,7 +66,12 @@ export class WebSocketService {
     'CalibPWMData',
     'CalibRunDone',
     'ImuAck',
-    'console_log'
+    'console_log',
+  
+      // overlays / debug channels
+    'TrafficSignCamera',
+    'TrafficSignMask',
+    'LaneAssistMask',  
   ]);
 
   constructor() {
@@ -174,6 +179,10 @@ export class WebSocketService {
     return this.webSocket.fromEvent('TrafficSignMask');
   }
 
+  receiveLaneAssistMask(): Observable<any> { 
+    return this.webSocket.fromEvent('LaneAssistMask'); 
+  }
+  
   // Method to receive location updates
   receiveLocation(): Observable<any> {
     return this.webSocket.fromEvent('Location');

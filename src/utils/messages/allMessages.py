@@ -53,6 +53,12 @@ class TrafficSignMask(Enum):
     msgID = 43                    # pick an unused id
     msgType = "str"                  # base64 string (PNG with alpha)
 
+class LaneAssistMask(Enum):
+    Queue = "General"
+    Owner = "ANY"
+    msgID = 44
+    msgType = "str"
+
 class Recording(Enum):
     Queue = "General"
     Owner = "threadCamera"

@@ -76,6 +76,8 @@ from src.statemachine.systemMode import SystemMode
 
 # ------ New component imports starts here ------#
 from src.perception.trafficSignDetection.processTrafficSignDetection import processTrafficSignDetection
+from src.perception.trafficSignDetection.processTrafficSignDetection import processTrafficSignDetection
+from src.perception.laneAssist.processLaneAssist import processLaneAssist
 
 
 # ------ New component imports ends here ------#
@@ -193,6 +195,22 @@ def _run():
     )
     allProcesses.append(processTSD)
     allEvents.append(tsd_ready)
+
+
+    # Initializing lane assist
+    la_ready = Event()
+    processLA = processLaneAssist(
+        queueList,
+        logging,
+        la_ready,
+        debugging=False,
+        input_message="serialCamera",   # IMPORTANT: overlay matches dashboard live stream
+        target_fps=5.0,
+        camera_type="455",
+        dashboard_size=(512, 270),
+    )
+    allProcesses.append(processLA)
+    allEvents.append(la_ready)
 
 
     # ------ New component initialize ends here ------#
