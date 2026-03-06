@@ -84,6 +84,7 @@ export class AppComponent implements OnDestroy {
   @ViewChild(ClusterComponent) clusterComponent!: ClusterComponent;
   @ViewChild(TableComponent) tableComponent!: TableComponent;
   @ViewChild('stateSwitch') stateSwitchComponent!: StateSwitchComponent;
+  @ViewChild(ConsoleComponent) consoleComponent!: ConsoleComponent;
 
   constructor(private webSocketService: WebSocketService, private clusterService: ClusterService) { }
 
@@ -301,5 +302,12 @@ export class AppComponent implements OnDestroy {
 
   toggleConsole() {
     this.showConsoleModal = !this.showConsoleModal;
+  }
+
+  dashboardReset() {
+    // Notify backend (route state + camera seek) AND all local components via Subject
+    this.webSocketService.requestDashboardReset();
+    // Console, map, and camera components all subscribe to dashboardReset$
+    // and handle their own cleanup immediately.
   }
 }

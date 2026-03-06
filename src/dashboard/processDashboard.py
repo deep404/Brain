@@ -46,10 +46,12 @@ from enum import Enum
 from src.utils.messages.messageHandlerSubscriber import messageHandlerSubscriber
 from src.utils.messages.messageHandlerSender import messageHandlerSender
 from src.templates.workerprocess import WorkerProcess
-from src.utils.messages.allMessages import Semaphores
+from src.utils.messages.allMessages import Semaphores, CameraReset
 from src.statemachine.stateMachine import StateMachine
 from src.dashboard.components.calibration import Calibration
 from src.dashboard.components.ip_manger import IpManager
+from src.routePlanning.routePlanner import RoutePlanner
+from src.utils.config import cfg
 
 import src.utils.messages.allMessages as allMessages
 
@@ -113,6 +115,33 @@ class processDashboard(WorkerProcess):
         # calibration
         self.calibration = Calibration(self.queueList, self.socketio)
 
+        # route planning
+        try:
+            self.route_planner = RoutePlanner(graphml_path=cfg.GRAPHML_PATH)
+            self._route_data = None
+            self._current_route_idx = 0
+            self._stop_line_counter = 0
+            self._last_sign_route_idx = 0          # last position confirmed by a sign
+            self._last_sign_label = ""              # last sign label used for jump
+            self._sign_lookup = {}                  # sign_type -> [{route_idx, x, y, node}]
+            self._stop_line_signs = {}              # stop_line_node -> [sign_types]
+            self._instruction_lookup = {}           # stop_line_node -> instruction dict
+            # 3-consecutive-frame TSD confirmation
+            self._tsd_consec_label = ""
+            self._tsd_consec_count = 0
+            self._tsd_consec_match = None
+            self._tsd_consec_idx = -1
+            # AND logic: both stop line + TSD must confirm together
+            self._pending_sl_confirmed = False
+            self._pending_sl_target = None          # stop line dict {node, route_idx, x, y}
+            self._pending_tsd_confirmed = False
+            self._pending_tsd_label = ""            # normalized sign label that was confirmed
+            self._dash_print("\033[1;97m[ Dashboard ] :\033[0m \033[1;92mINFO\033[0m - Route planner loaded successfully")
+        except Exception as e:
+            self.route_planner = None
+            self._route_data = None
+            self._dash_print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;91mERROR\033[0m - Route planner init failed: {e}")
+
         # initialize message handling
         self._initialize_messages()
         self._setup_websocket_handlers()
@@ -125,6 +154,12 @@ class processDashboard(WorkerProcess):
         """Get the path for table state file."""
         base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         return os.path.join(base_path, 'src', 'utils', 'table_state.json')
+
+    def _dash_print(self, msg: str):
+        """Print to terminal (MultiWriter routes it to both stdout AND Log queue.
+        stream_console_logs picks it up from the queue and emits to the frontend console).
+        """
+        print(msg, flush=True)
     
 
     def _initialize_messages(self):
@@ -132,6 +167,9 @@ class processDashboard(WorkerProcess):
         self.get_name_and_vals()
         self.messagesAndVals.pop("mainCamera", None)
         self.messagesAndVals.pop("Semaphores", None)
+        # Route planning messages are handled internally, not via gateway
+        self.messagesAndVals.pop("RoutePlanData", None)
+        self.messagesAndVals.pop("CarMapPosition", None)
         self.subscribe()
     
 
@@ -153,7 +191,12 @@ class processDashboard(WorkerProcess):
         eventlet.spawn(self.stream_console_logs)
 
     def stream_console_logs(self):
-        """Monitor the Log queue and emit messages to frontend."""
+        """Forward Log queue messages to the frontend console.
+        
+        NOTE: Do NOT print() here! sys.stdout is wrapped by MultiWriter which
+        puts every print() back into this same Log queue → infinite loop.
+        Terminal output is already handled by MultiWriter (stdout → real terminal).
+        """
         log_queue = self.queueList.get("Log")
         if not log_queue:
             return
@@ -162,6 +205,7 @@ class processDashboard(WorkerProcess):
             try:
                 while not log_queue.empty():
                     msg = log_queue.get_nowait()
+                    # Emit to frontend dashboard console only
                     self.socketio.emit('console_log', {'data': msg})
                     eventlet.sleep(0)
                 
@@ -231,7 +275,7 @@ class processDashboard(WorkerProcess):
             if dataName == "SessionAccess":
                 self.handle_single_user_session(socketId)
             elif self.sessionActive and self.activeUser != socketId:
-                print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;93mWARNING\033[0m - Message received from unauthorized user \033[94m{socketId}\033[0m")
+                self._dash_print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;93mWARNING\033[0m - Message received from unauthorized user \033[94m{socketId}\033[0m")
                 return
 
             if dataName == "Heartbeat":
@@ -244,6 +288,10 @@ class processDashboard(WorkerProcess):
                 self.handle_calibration(dataDict, socketId)
             elif dataName == "GetCurrentSerialConnectionState":
                 self.handle_get_current_serial_connection_state(socketId)
+            elif dataName == "GetMapGraphData":
+                self.handle_get_map_graph_data(socketId)
+            elif dataName == "DashboardReset":
+                self.handle_dashboard_reset(socketId)
             else:
                 self.send_message_to_brain(dataName, dataDict)
 
@@ -262,7 +310,26 @@ class processDashboard(WorkerProcess):
 
     def handle_driving_mode(self, dataDict):
         """Handle driving mode change."""
-        self.stateMachine.request_mode(f"dashboard_{dataDict['Value']}_button")
+        mode = dataDict.get('Value', '').lower()
+        self.stateMachine.request_mode(f"dashboard_{mode}_button")
+
+        # Trigger route planning for active driving modes
+        if mode in ('manual', 'legacy', 'auto'):
+            self._compute_and_emit_route()
+        elif mode == 'stop':
+            self._route_data = None
+            self._current_route_idx = 0
+            self._stop_line_counter = 0
+            self._last_sign_route_idx = 0
+            self._last_sign_label = ""
+            self._tsd_consec_label = ""
+            self._tsd_consec_count = 0
+            self._tsd_consec_match = None
+            self._tsd_consec_idx = -1
+            self._pending_sl_confirmed = False
+            self._pending_sl_target = None
+            self._pending_tsd_confirmed = False
+            self._pending_tsd_label = ""
 
 
     def handle_calibration(self, dataDict, socketId):
@@ -270,9 +337,466 @@ class processDashboard(WorkerProcess):
         self.calibration.handle_calibration_signal(dataDict, socketId)
 
 
+    def _compute_and_emit_route(self):
+        """Compute route and emit to frontend via WebSocket."""
+        if self.route_planner is None:
+            return
+
+        try:
+            self._route_data = self.route_planner.compute_route(
+                start_id=cfg.ROUTE_START,
+                finish_id=cfg.ROUTE_FINISH,
+                must_pass=cfg.ROUTE_CHECKPOINTS,
+                visit_in_order=cfg.ROUTE_VISIT_IN_ORDER,
+            )
+            self._current_route_idx = 0
+            self._stop_line_counter = 0
+            self._last_sign_route_idx = 0
+            self._last_sign_label = ""
+
+            # Pre-build a lookup: sign_type -> list of {route_idx, x, y, node}
+            # sorted by nearest_route_idx for efficient searching.
+            self._sign_lookup = {}
+            for s in self._route_data.get('signs_on_route', []):
+                st = s['type']
+                if st not in self._sign_lookup:
+                    self._sign_lookup[st] = []
+                self._sign_lookup[st].append(s)
+            for st in self._sign_lookup:
+                self._sign_lookup[st].sort(
+                    key=lambda e: e.get('nearest_route_idx', e.get('route_idx', 999999))
+                )
+
+            # Build cross-reference: stop_line_node -> list of sign types
+            # co-located at the same node (used for position validation).
+            self._stop_line_signs = {}
+            for s in self._route_data.get('signs_on_route', []):
+                if s.get('is_stop_line', False):
+                    node = s['node']
+                    if node not in self._stop_line_signs:
+                        self._stop_line_signs[node] = []
+                    self._stop_line_signs[node].append(s['type'])
+
+            # Build instruction lookup: stop_line_node -> instruction dict
+            # so we can print the maneuver when the car reaches a stop line.
+            self._instruction_lookup = {}
+            for instr in self._route_data.get('instructions', []):
+                sl = instr.get('stop_line')
+                if sl is not None:
+                    self._instruction_lookup[str(sl)] = instr
+
+            # Reset TSD consecutive counters and AND-logic pending state
+            self._tsd_consec_label = ""
+            self._tsd_consec_count = 0
+            self._tsd_consec_match = None
+            self._tsd_consec_idx = -1
+            self._pending_sl_confirmed = False
+            self._pending_sl_target = None
+            self._pending_tsd_confirmed = False
+            self._pending_tsd_label = ""
+
+            # Emit route data to frontend
+            self.socketio.emit('RoutePlanData', {
+                'route_coords': self._route_data['route_coords'],
+                'stop_lines': self._route_data['stop_lines_on_route'],
+                'signs': self._route_data['signs_on_route'],
+                'instructions': self._route_data['instructions'],
+            })
+
+            # Emit initial car position (start node)
+            if self._route_data['route_coords']:
+                start_pos = self._route_data['route_coords'][0]
+                self.socketio.emit('CarMapPosition', {
+                    'x': start_pos[0],
+                    'y': start_pos[1],
+                    'route_idx': 0,
+                    'total_nodes': len(self._route_data['route_nodes']),
+                })
+
+            self._dash_print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;92mINFO\033[0m - Route computed: {len(self._route_data['route_nodes'])} nodes, {len(self._route_data['stop_lines_on_route'])} stop lines, {len(self._route_data['signs_on_route'])} signs")
+        except Exception as e:
+            self._dash_print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;91mERROR\033[0m - Route computation failed: {e}")
+
+
+    # ─── YOLO label → SIGNS key normalization ───────────────────────────
+    # Actual YOLO model class names:
+    # ['car', 'crossed_highway_sign', 'green_light', 'highway_sign',
+    #  'no_entry_sign', 'one_way_road_sign', 'parking_sign', 'pedestrian',
+    #  'pedestrian_sign', 'priority_sign', 'red_light', 'road_blocked_barrier',
+    #  'roadblock', 'roundabout_sign', 'signs', 'stop_sign', 'yellow_light']
+    _LABEL_ALIASES = {
+        # Traffic lights (any colour → traffic_light)
+        "green_light":          "traffic_light",
+        "red_light":            "traffic_light",
+        "yellow_light":         "traffic_light",
+        "traffic light":        "traffic_light",
+        "trafficlight":         "traffic_light",
+        "traffic_light":        "traffic_light",
+        "traffic light green":  "traffic_light",
+        "traffic light red":    "traffic_light",
+        "traffic light yellow": "traffic_light",
+        "traffic_light_green":  "traffic_light",
+        "traffic_light_red":    "traffic_light",
+        "traffic_light_yellow": "traffic_light",
+        # Stop
+        "stop_sign":      "stop",
+        "stopsign":       "stop",
+        "stop sign":      "stop",
+        "stop":           "stop",
+        # Priority
+        "priority_sign":  "priority",
+        "priority":       "priority",
+        "priority road":  "priority",
+        # Highway
+        "highway_sign":          "highway_entry",
+        "highway entry":         "highway_entry",
+        "highway_entry":         "highway_entry",
+        "crossed_highway_sign":  "highway_exit",
+        "highway exit":          "highway_exit",
+        "highway_exit":          "highway_exit",
+        # Roundabout
+        "roundabout_sign": "roundabout",
+        "roundabout":      "roundabout",
+        # Crosswalk / pedestrian
+        "pedestrian":      "crosswalk",
+        "pedestrian_sign": "crosswalk",
+        "crosswalk":       "crosswalk",
+        # No entry
+        "no_entry_sign":  "no_entry",
+        "no entry":       "no_entry",
+        "no_entry":       "no_entry",
+        "noentry":        "no_entry",
+        # One way
+        "one_way_road_sign": "one_way",
+        "one way":           "one_way",
+        "one_way":           "one_way",
+        "oneway":            "one_way",
+        # Parking
+        "parking_sign":   "parking",
+        "parking":        "parking",
+    }
+
+    @classmethod
+    def _normalize_label(cls, raw: str) -> str:
+        """Map a YOLO detection label to the canonical SIGNS key."""
+        key = raw.strip().lower()
+        # exact alias lookup
+        if key in cls._LABEL_ALIASES:
+            return cls._LABEL_ALIASES[key]
+        # fallback: replace spaces / hyphens with underscores
+        key = key.replace(" ", "_").replace("-", "_")
+        if key in cls._LABEL_ALIASES:
+            return cls._LABEL_ALIASES[key]
+        # catch-all: any label containing "light" → traffic_light
+        if "light" in key:
+            return "traffic_light"
+        return key
+
+    # ─── helpers: position tracking ─────────────────────────────────────
+
+    def _advance_position(self, new_route_idx: int, x: float, y: float,
+                          source: str, extra: dict = None) -> bool:
+        """
+        Advance the car position on the route (never backwards).
+        Emits CarMapPosition to the frontend.
+        Returns True if position was actually advanced.
+        """
+        if new_route_idx <= self._current_route_idx:
+            return False  # prevent backward jumps
+
+        self._current_route_idx = new_route_idx
+        payload = {
+            'x': x,
+            'y': y,
+            'route_idx': self._current_route_idx,
+            'total_nodes': len(self._route_data['route_nodes']),
+            'source': source,
+        }
+        if extra:
+            payload.update(extra)
+        self.socketio.emit('CarMapPosition', payload)
+        return True
+
+    def _get_next_target_stop_line(self):
+        """Return the next stop line dict ahead of current position, or None."""
+        if self._route_data is None:
+            return None
+        for sl in self._route_data.get('stop_lines_on_route', []):
+            if sl.get('route_idx', -1) > self._current_route_idx:
+                return sl
+        return None
+
+    def _clear_pending(self):
+        """Clear both pending flags after an intersection is confirmed or rejected."""
+        self._pending_sl_confirmed = False
+        self._pending_sl_target = None
+        self._pending_tsd_confirmed = False
+        self._pending_tsd_label = ""
+
+    def _try_confirm_intersection(self):
+        """
+        Check if BOTH stop-line AND TSD are confirmed for the same target.
+        If so, advance position and print a detailed passage log.
+        If the target has no expected signs, stop-line alone is sufficient.
+        """
+        target = self._pending_sl_target
+        if target is None:
+            return
+
+        instr = self._instruction_lookup.get(str(target['node']))
+        expected = instr.get('signs_at_stop', []) if instr else []
+
+        # --- No expected signs → allow stop-line-only confirmation -----------
+        if not expected and self._pending_sl_confirmed:
+            advanced = self._advance_position(
+                target['route_idx'], target['x'], target['y'],
+                source='stop_line',
+                extra={
+                    'at_stop_line': True,
+                    'stop_line_node': target['node'],
+                    'colocated_signs': [],
+                },
+            )
+            if advanced:
+                self._stop_line_counter += 1
+                itype = instr['type'].upper() if instr else 'STOP LINE'
+                action = instr.get('action', '?') if instr else '?'
+                self._dash_print(
+                    f"\033[1;97m[ Dashboard ] :\033[0m \033[1;92mINFO\033[0m - "
+                    f"#{self._stop_line_counter} {itype} at node {target['node']} was passed "
+                    f"(stop line confirmed, no signs expected). Action: {action}"
+                )
+            self._clear_pending()
+            return
+
+        # --- AND logic: both must be confirmed --------------------------------
+        if self._pending_sl_confirmed and self._pending_tsd_confirmed:
+            advanced = self._advance_position(
+                target['route_idx'], target['x'], target['y'],
+                source='stop_line+tsd',
+                extra={
+                    'at_stop_line': True,
+                    'stop_line_node': target['node'],
+                    'colocated_signs': expected,
+                    'confirmed_sign': self._pending_tsd_label,
+                },
+            )
+            if advanced:
+                self._stop_line_counter += 1
+                itype = instr['type'].upper() if instr else 'STOP LINE'
+                action = instr.get('action', '?') if instr else '?'
+                sign_display = self._pending_tsd_label.replace('_', ' ').upper()
+                self._dash_print(
+                    f"\033[1;97m[ Dashboard ] :\033[0m \033[1;92mINFO\033[0m - "
+                    f"#{self._stop_line_counter} {itype} at node {target['node']} was passed "
+                    f"because STOP LINE at node {target['node']} AND {sign_display} "
+                    f"were both confirmed. Action: {action}"
+                )
+            self._clear_pending()
+            return
+
+    def _handle_stop_line_event(self, event):
+        """
+        Record that a stop line has been confirmed (after LA 3-frame check).
+        Does NOT advance position by itself — waits for TSD confirmation
+        via _try_confirm_intersection() (AND logic).
+        """
+        if self._route_data is None:
+            return
+
+        target = self._get_next_target_stop_line()
+        if target is None:
+            return  # no stop line ahead
+
+        # If we already have a pending confirmation for a DIFFERENT target, clear it
+        if (self._pending_sl_target is not None and
+                self._pending_sl_target['node'] != target['node']):
+            self._clear_pending()
+
+        self._pending_sl_confirmed = True
+        self._pending_sl_target = target
+
+        # Look up expected signs from the instruction
+        instr = self._instruction_lookup.get(str(target['node']))
+        expected = instr.get('signs_at_stop', []) if instr else []
+
+        if expected:
+            sign_labels = ', '.join(s.replace('_', ' ').upper() for s in expected)
+            self._dash_print(
+                f"\033[1;97m[ Dashboard ] :\033[0m \033[1;96mINFO\033[0m - "
+                f"Stop line at node {target['node']} confirmed. "
+                f"Waiting for TSD ({sign_labels})..."
+            )
+        else:
+            self._dash_print(
+                f"\033[1;97m[ Dashboard ] :\033[0m \033[1;96mINFO\033[0m - "
+                f"Stop line at node {target['node']} confirmed (no signs expected)."
+            )
+
+        self._try_confirm_intersection()
+
+    def _handle_traffic_sign_event(self, event):
+        """
+        Use detected traffic signs with ROI filtering to confirm position.
+        Requires 3 consecutive frames with the SAME matching sign before
+        considering it confirmed (prevents false positives).
+
+        Does NOT advance position directly — sets the TSD pending flag and
+        delegates to _try_confirm_intersection() (AND logic with stop line).
+
+        Pipeline:
+        1. Normalize the YOLO label to the canonical SIGNS key.
+        2. For each detection compute bbox_area / frame_area (area ratio).
+        3. Keep only detections with ratio >= cfg.SIGN_ROI_MIN_RATIO.
+        4. Match the label against expected signs for the next target stop line.
+        5. If the same match persists for 3 consecutive frames, set pending TSD flag.
+        """
+        if self._route_data is None:
+            return
+
+        detections = event.get('detections', [])
+        if not detections:
+            self._tsd_consec_count = 0
+            self._tsd_consec_label = ""
+            return
+
+        frame_w = event.get('frame_w', 1)
+        frame_h = event.get('frame_h', 1)
+        frame_area = max(frame_w * frame_h, 1)
+
+        min_conf = cfg.SIGN_TRACK_CONFIDENCE
+        min_ratio = cfg.SIGN_ROI_MIN_RATIO
+
+        # Determine what signs we expect at the next target
+        target = self._pending_sl_target or self._get_next_target_stop_line()
+        if target is None:
+            return
+        instr = self._instruction_lookup.get(str(target['node']))
+        expected_signs = instr.get('signs_at_stop', []) if instr else []
+        if not expected_signs:
+            return  # no signs expected → TSD not needed for this target
+
+        best_label = ""
+        best_conf = 0.0
+
+        for det in detections:
+            conf = det.get('confidence', 0)
+            if conf < min_conf:
+                continue
+
+            raw_label = det.get('label', '')
+            label = self._normalize_label(raw_label)
+
+            # ROI filter: bbox area ratio
+            bbox = det.get('bbox')
+            if bbox:
+                x1, y1, x2, y2 = bbox
+                bbox_area = abs((x2 - x1) * (y2 - y1))
+                ratio = bbox_area / frame_area
+                if ratio < min_ratio:
+                    continue
+
+            # Only accept detections that match expected signs at the next target
+            if label in expected_signs and conf > best_conf:
+                best_label = label
+                best_conf = conf
+
+        # ── 3-consecutive-frame confirmation ─────────────────────────────
+        if best_label:
+            if best_label == self._tsd_consec_label:
+                self._tsd_consec_count += 1
+            else:
+                self._tsd_consec_label = best_label
+                self._tsd_consec_count = 1
+
+            if self._tsd_consec_count >= 3:
+                self._pending_tsd_confirmed = True
+                self._pending_tsd_label = best_label
+                # Ensure the pending target is set even if stop line hasn't fired yet
+                if self._pending_sl_target is None:
+                    self._pending_sl_target = target
+
+                self._dash_print(
+                    f"\033[1;97m[ Dashboard ] :\033[0m \033[1;96mINFO\033[0m - "
+                    f"TSD confirmed: {best_label.replace('_', ' ').upper()} "
+                    f"(3 frames). "
+                    f"{'Stop line already confirmed.' if self._pending_sl_confirmed else 'Waiting for stop line...'}"
+                )
+                self._tsd_consec_count = 0
+                self._tsd_consec_label = ""
+                self._try_confirm_intersection()
+        else:
+            self._tsd_consec_count = 0
+            self._tsd_consec_label = ""
+
+        # Always forward high-confidence near-sign detections to frontend
+        for det in detections:
+            if det.get('confidence', 0) >= min_conf:
+                self.socketio.emit('TrafficSignDetected', {
+                    'label': self._normalize_label(det.get('label', '')),
+                    'confidence': round(det['confidence'], 2),
+                })
+
+
     def handle_get_current_serial_connection_state(self, socketId):
         """Handle getting the current serial connection state."""
         self.socketio.emit('current_serial_connection_state', {'data': self.serialConnected}, room=socketId)
+
+
+    def handle_get_map_graph_data(self, socketId):
+        """Send the full map graph data (nodes, edges, signs, stop lines) to a client."""
+        if self.route_planner is None:
+            self.socketio.emit('MapGraphData', {'error': 'Route planner not initialised'}, room=socketId)
+            return
+
+        try:
+            graph_data = self.route_planner.get_graph_data()
+            self.socketio.emit('MapGraphData', graph_data, room=socketId)
+            self._dash_print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;92mINFO\033[0m - Sent map graph data to \033[94m{socketId}\033[0m ({len(graph_data['nodes'])} nodes, {len(graph_data['edges'])} edges)")
+        except Exception as e:
+            self._dash_print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;91mERROR\033[0m - Failed to send graph data: {e}")
+            self.socketio.emit('MapGraphData', {'error': str(e)}, room=socketId)
+
+
+    def handle_dashboard_reset(self, socketId):
+        """
+        Full dashboard reset:
+        - Reset route tracking state
+        - Send CameraReset to rewind video to frame 0
+        - Emit DashboardReset to frontend (clear console, map, overlays)
+        """
+        # 1. Reset route tracking state
+        self._route_data = None
+        self._current_route_idx = 0
+        self._stop_line_counter = 0
+        self._last_sign_route_idx = 0
+        self._last_sign_label = ""
+        self._sign_lookup = {}
+        self._stop_line_signs = {}
+        self._instruction_lookup = {}
+        self._tsd_consec_label = ""
+        self._tsd_consec_count = 0
+        self._tsd_consec_match = None
+        self._tsd_consec_idx = -1
+        self._pending_sl_confirmed = False
+        self._pending_sl_target = None
+        self._pending_tsd_confirmed = False
+        self._pending_tsd_label = ""
+
+        # 2. Send CameraReset message to camera thread (seek video to frame 0)
+        try:
+            camera_reset_sender = messageHandlerSender(self.queuesList, CameraReset)
+            camera_reset_sender.send({"reset": True})
+        except Exception as e:
+            self._dash_print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;93mWARNING\033[0m - CameraReset send failed: {e}")
+
+        # 3. Emit DashboardReset to frontend
+        self.socketio.emit('DashboardReset', {'reset': True}, room=socketId)
+
+        self._dash_print(
+            f"\033[1;97m[ Dashboard ] :\033[0m \033[1;92mINFO\033[0m - "
+            f"Dashboard reset triggered by \033[94m{socketId}\033[0m"
+        )
 
 
     def handle_single_user_session(self, socketId):
@@ -280,14 +804,14 @@ class processDashboard(WorkerProcess):
         if not self.sessionActive:
             self.sessionActive = True
             self.activeUser = socketId
-            print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;92mINFO\033[0m - Session access granted to \033[94m{socketId}\033[0m")
+            self._dash_print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;92mINFO\033[0m - Session access granted to \033[94m{socketId}\033[0m")
             self.socketio.emit('session_access', {'data': True}, room=socketId)
             self.send_message_to_brain("RequestSteerLimits", {"Value": True})
         elif self.activeUser == socketId:
             self.socketio.emit('session_access', {'data': True}, room=socketId)
             self.send_message_to_brain("RequestSteerLimits", {"Value": True})
         else:
-            print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;92mINFO\033[0m - Session access denied to \033[94m{socketId}\033[0m")
+            self._dash_print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;92mINFO\033[0m - Session access denied to \033[94m{socketId}\033[0m")
             self.socketio.emit('session_access', {'data': False}, room=socketId)
 
 
@@ -366,7 +890,7 @@ class processDashboard(WorkerProcess):
             if self.heartbeat_retries < self.heartbeat_max_retries:
                 self.socketio.emit('heartbeat', {'data': 'Heartbeat'})
             else:
-                print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;93mWARNING\033[0m - Connection lost with peer \033[94m{self.activeUser}\033[0m")
+                self._dash_print(f"\033[1;97m[ Dashboard ] :\033[0m \033[1;93mWARNING\033[0m - Connection lost with peer \033[94m{self.activeUser}\033[0m")
                 self.socketio.emit('heartbeat_disconnect', {'data': 'Heartbeat timeout'})
                 self.sessionActive = False
                 self.activeUser = None
@@ -389,11 +913,20 @@ class processDashboard(WorkerProcess):
                 if msg == "SerialConnectionState":
                     self.serialConnected = resp
 
-                self.socketio.emit(msg, {"value": resp})
+                # Handle stop line events for position tracking
+                if msg == "StopLineEvent" and isinstance(resp, dict) and resp.get("detected"):
+                    self._handle_stop_line_event(resp)
+                    # Don't emit raw stop line events to frontend
+                elif msg == "TrafficSignEvent" and isinstance(resp, dict):
+                    self._handle_traffic_sign_event(resp)
+                    # Don't emit raw sign events to frontend
+                else:
+                    self.socketio.emit(msg, {"value": resp})
+
                 if self.debugging:
                     self.logger.info(f"{msg}: {resp}")
 
-        eventlet.spawn_after(0.1, self.send_continuous_messages)
+        eventlet.spawn_after(0.033, self.send_continuous_messages)  # ~30fps polling
 
 
     def send_hardware_data_to_frontend(self):

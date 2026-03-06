@@ -79,13 +79,16 @@ from src.perception.trafficSignDetection.processTrafficSignDetection import proc
 from src.perception.trafficSignDetection.processTrafficSignDetection import processTrafficSignDetection
 from src.perception.laneAssist.processLaneAssist import processLaneAssist
 
+from src.utils.config import cfg
 
 # ------ New component imports ends here ------#
 
 # ===================================== SHUTDOWN PROCESS ====================================
 
-def shutdown_process(process, timeout=1):
+def shutdown_process(process, timeout=None):
     """Helper function to gracefully shutdown a process."""
+    if timeout is None:
+        timeout = cfg.SHUTDOWN_TIMEOUT
     process.join(timeout)
     if process.is_alive():
         print(f"The process {process} cannot normally stop, it's blocked somewhere! Terminate it!")
@@ -113,8 +116,6 @@ def manage_process_life(process_class, process_instance, process_args, enabled, 
     return process_instance 
 
 # ======================================== SETTING UP ====================================
-USE_LIVE_CAMERA = False   # True = picamera2, False = loop mp4
-VIDEO_PATH = "raw_data/bfmc2020_online_2.mp4"
 
 def _run():
     global logging
@@ -151,29 +152,29 @@ def _run():
 
     # Initializing dashboard
     dashboard_ready = Event()
-    processDashboard = ProcessDashboard(queueList, logging, dashboard_ready, debugging = False)
+    processDashboard = ProcessDashboard(queueList, logging, dashboard_ready, debugging=cfg.DASHBOARD_DEBUG)
 
     # Initializing camera
     camera_ready = Event()
     processCamera = ProcessCamera(
-        queueList, logging, camera_ready, debugging=False,
-        use_live_camera=USE_LIVE_CAMERA,
-        video_path=VIDEO_PATH,
-        loop_video=True,
-        target_fps=20.0,
+        queueList, logging, camera_ready, debugging=cfg.CAMERA_DEBUG,
+        use_live_camera=cfg.USE_LIVE_CAMERA,
+        video_path=cfg.VIDEO_PATH,
+        loop_video=cfg.LOOP_VIDEO,
+        target_fps=cfg.CAMERA_FPS,
     )
 
     # Initializing semaphores
     semaphore_ready = Event()
-    processSemaphore = ProcessSemaphores(queueList, logging, semaphore_ready, debugging = False)
+    processSemaphore = ProcessSemaphores(queueList, logging, semaphore_ready, debugging=cfg.SEMAPHORE_DEBUG)
 
     # Initializing GPS
     traffic_com_ready = Event()
-    processTrafficCom = ProcessTrafficCommunication(queueList, logging, 3, traffic_com_ready, debugging = False)
+    processTrafficCom = ProcessTrafficCommunication(queueList, logging, cfg.TRAFFIC_COM_DEVICE_ID, traffic_com_ready, debugging=cfg.TRAFFIC_COM_DEBUG)
 
     # Initializing serial connection NUCLEO - > PI
     serial_handler_ready = Event()
-    processSerialHandler = ProcessSerialHandler(queueList, logging, serial_handler_ready, dashboard_ready, debugging = False)
+    processSerialHandler = ProcessSerialHandler(queueList, logging, serial_handler_ready, dashboard_ready, debugging=cfg.SERIAL_DEBUG)
 
     # Adding all processes to the list
     allProcesses.extend([processCamera, processSemaphore, processTrafficCom, processSerialHandler, processDashboard])
@@ -186,12 +187,12 @@ def _run():
         queueList,
         logging,
         tsd_ready,
-        debugging=False,
-        weights_path="traffic-sign-detection-model/traffic-sign-yolo26n-bfmc.pt",  # adjust to your repo paths
-        input_message="mainCamera",  # or "serialCamera"
-        target_fps=10.0,              # can be lower (0.5 etc.)
-        conf=0.25,
-        imgsz=640,
+        debugging=cfg.TSD_DEBUG,
+        weights_path=cfg.TSD_WEIGHTS,
+        input_message=cfg.TSD_INPUT_MESSAGE,
+        target_fps=cfg.TSD_FPS,
+        conf=cfg.TSD_CONFIDENCE,
+        imgsz=cfg.TSD_IMGSZ,
     )
     allProcesses.append(processTSD)
     allEvents.append(tsd_ready)
@@ -203,11 +204,11 @@ def _run():
         queueList,
         logging,
         la_ready,
-        debugging=False,
-        input_message="serialCamera",   # IMPORTANT: overlay matches dashboard live stream
-        target_fps=5.0,
-        camera_type="455",
-        dashboard_size=(512, 270),
+        debugging=cfg.LA_DEBUG,
+        input_message=cfg.LA_INPUT_MESSAGE,
+        target_fps=cfg.LA_FPS,
+        camera_type=cfg.CAMERA_TYPE,
+        dashboard_size=cfg.DASHBOARD_SIZE,
     )
     allProcesses.append(processLA)
     allEvents.append(la_ready)
@@ -232,7 +233,7 @@ def _run():
         # apply starting mode
         StateMachine.initialize_starting_mode()
 
-        time.sleep(10)
+        time.sleep(cfg.STARTUP_DELAY)
         print(BigPrint.C4_BOMB.value)
         print(BigPrint.PRESS_CTRL_C.value)
 
@@ -242,8 +243,8 @@ def _run():
                 modeDictSemaphore = SystemMode[message].value["semaphore"]["process"]
                 modeDictTrafficCom = SystemMode[message].value["traffic_com"]["process"]
 
-                processSemaphore = manage_process_life(ProcessSemaphores, processSemaphore, [queueList, logging, semaphore_ready, False], modeDictSemaphore["enabled"], allProcesses)
-                processTrafficCom = manage_process_life(ProcessTrafficCommunication, processTrafficCom, [queueList, logging, 3, traffic_com_ready, False], modeDictTrafficCom["enabled"], allProcesses)
+                processSemaphore = manage_process_life(ProcessSemaphores, processSemaphore, [queueList, logging, semaphore_ready, cfg.SEMAPHORE_DEBUG], modeDictSemaphore["enabled"], allProcesses)
+                processTrafficCom = manage_process_life(ProcessTrafficCommunication, processTrafficCom, [queueList, logging, cfg.TRAFFIC_COM_DEVICE_ID, traffic_com_ready, cfg.TRAFFIC_COM_DEBUG], modeDictTrafficCom["enabled"], allProcesses)
 
             blocker.wait(0.1)
 

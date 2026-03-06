@@ -34,170 +34,139 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
     border: 0.1vw solid gray;
 }
 
-.cluster-instruments { 
+/* ---- Top row: Map + Camera ---- */
+.cluster-top-row {
     display: flex;
-    position: absolute;
-    flex-direction: column;
-    width: 100%;
-    height: 100%;
-}
-
-.cluster-instruments-main { 
-    display: flex;
-    position: absolute;
     flex-direction: row;
-    top: 30%;
-    left: 5%;
-    width: 90%;
-    height: 40%;
-    justify-content: center;
-    gap: 25%;
-}
-
-.cluster-instruments-secondary {
-    display: flex;
-    position: absolute;
-    flex-direction: row;
-    top: 54%;
     width: 100%;
-    height: 30%;
-    gap: 43.5%;
-    padding-right: 1%;
+    height: 52%;
+    gap: 0.5%;
+    padding: 0.5%;
 }
 
-.cluster-instruments-switches { 
-    display: flex;
-    flex-direction: column;
+.cluster-map-wrapper {
+    flex: 1;
     position: relative;
-    top: 17%;
-    gap: 10%;
-    width: 30%;
-    height: 50%;
+    overflow: hidden;
+    border: 0.15vw solid rgba(255, 255, 255, 0.15);
+    border-radius: 0.4vw;
+    background: rgba(0, 0, 0, 0.2);
 }
 
-.cluster-battery-level, .cluster-speedometer { 
-    width: 100%;
-    height: 100%;
-}
-
-.cluster-instant-consumption { 
-    width: 20%;
-    height: 100%;
-    padding-bottom: 5%;
-}
-
-.cluster-state-switch { 
-    width: 100%;
-    height: 45%;
-}
-
-.cluster-kl-switch { 
-    width: 50%;
-    height: 45%;
-}
-
-.cluster-map { 
-    position: absolute;
-    top: 3%;
-    left: 20%;
-    width: 60%;
-    height: 47%;
-}
-
-.cluster-digital-container { 
+.cluster-camera-wrapper {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    border: 0.2vw solid rgba(220, 50, 50, 0.7);
+    border-radius: 0.4vw;
+    background: rgba(0, 0, 0, 0.3);
     display: flex;
-    position: absolute;
-    top: 30%;
-    width: 100%;
-    height: 8%;
-    justify-content: space-between;
     align-items: center;
-    font-size: 1.7vw;
-    filter: drop-shadow(0 0 8vw rgba(0, 0, 0, 0.7));
+    justify-content: center;
+}
+
+.cluster-map {
+    width: 100%;
+    height: 100%;
+}
+
+.cluster-live-camera {
+    width: 100%;
+    height: auto;
+}
+
+/* ---- Bottom row: Gauges + Controls ---- */
+.cluster-bottom-row {
+    display: flex;
+    flex-direction: row;
+    width: 100%;
+    height: 48%;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 1%;
+}
+
+.cluster-bottom-left {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 28%;
+    height: 100%;
+    position: relative;
+}
+
+.cluster-bottom-center {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 34%;
+    height: 100%;
+}
+
+.cluster-bottom-right {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 28%;
+    height: 100%;
+    position: relative;
 }
 
 .cluster-digital-text-container {
     display: flex;
-    position: relative;
-    width: 38%;
     flex-direction: row;
     justify-content: center;
     align-items: center;
+    font-size: 1.5vw;
+    filter: drop-shadow(0 0 8vw rgba(0, 0, 0, 0.7));
+    margin-bottom: 0.3vw;
 }
 
-.cluster-digital-unit { 
-    position: relative; 
-    height: 30%;
-    font-size: 1vw;
+.cluster-digital-text {
+    font-size: 2.2vw;
+    margin: 0;
+    color: rgb(220, 60, 60);
+}
+
+.cluster-digital-unit {
+    position: relative;
+    font-size: 0.9vw;
     color: white;
     opacity: 0.7;
-    padding-top: 5%;
+    padding-top: 0.8vw;
+    margin-left: 0.2vw;
 }
 
-.cluster-car { 
-    position: absolute;
-    top: 58%;
-    left: 40%;
-    width: 20%;
-    height: 20%;
+.cluster-battery-level, .cluster-speedometer {
+    width: 100%;
+    height: 55%;
 }
 
-.cluster-steering { 
-    position: absolute;
-    top: 51%;
-    left: 43%;
-    width: 14%;
-    height: 3%;
+.cluster-hardware-data {
+    width: 90%;
+    height: 75%;
 }
 
-.cluster-record { 
-    position: absolute;
-    width: 8%;
-    left: 65%;
-    height: 5.5%;
-    top: 84.5%;
-    z-index: 5;
+.cluster-controls {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 85%;
+    gap: 0.6vw;
+    margin-top: 0.5vw;
 }
 
-.cluster-live-camera { 
-    position: absolute;
-    top: 76.5%;
-    left: 75%;
-    width: 22%;
+.cluster-state-switch {
+    width: 100%;
     height: auto;
 }
 
-.cluster-warning-light { 
-    position: absolute;
-    top: 60%;
-    left: 19%;
-    width: 19%;
+.cluster-kl-switch {
+    width: 50%;
     height: auto;
-}
-
-.cluster-hardware-data { 
-    position: absolute;
-    top: 82%;
-    left: 0.5%;
-    width: 30%;
-    height: 16%;
-}
-
-.cluster-time-speed-steer { 
-    position: absolute;
-    top: 80%;
-    left: 43.5%;
-    width: 13%;
-    height: 18%;
-    z-index: 5;
-}
-
-.cluster-side-marker { 
-    position: absolute;
-    top: 50.6%;
-    left: 39%;
-    width: 22%;
-    height: 5%;
 }
 
 @keyframes pulseRedShadow {
@@ -207,8 +176,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
     50% {
       box-shadow: 0 0 20px 10px rgba(255, 0, 0, 0.5);
     }
-  }
+}
   
-  .pulse-red {
+.pulse-red {
     animation: pulseRedShadow 1s infinite;
-  }
+}

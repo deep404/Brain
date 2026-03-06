@@ -26,43 +26,53 @@ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
 
-.map-container { 
-    display: flex;
-    position: relative;
-    justify-content: center;
-    align-items: center;
-    width: 100%;
-    height: 100%;
+.map-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #0d1117;
+  border-radius: 8px;
 }
 
-.map-track-container { 
-    display: flex;
-    position: relative;
-    justify-content: center;
-    align-items: center;
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
-    mask-image: radial-gradient(closest-side, rgba(0, 0, 0, 1) 60%, rgba(0, 0, 0, 0) 90%);
-    -webkit-mask-image: radial-gradient(closest-side, rgba(0, 0, 0, 1) 60%, rgba(0, 0, 0, 0) 90%);
-    mask-size: 100% 100%;
-    mask-repeat: no-repeat;
-    mask-position: center;
-    -webkit-mask-size: 100% 100%;
-    -webkit-mask-repeat: no-repeat;
-    -webkit-mask-position: center;
+.map-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 
-#map-track-image-container {
-    display: flex;
-    position: relative;
+.map-status {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: #888;
+  font-size: 14px;
 }
 
-#map-track-image {
-    position: absolute;
+.map-legend {
+  position: absolute;
+  bottom: 6px;
+  left: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  color: #ccc;
+  background: rgba(0, 0, 0, 0.6);
+  padding: 3px 8px;
+  border-radius: 4px;
 }
 
-#map-cursor { 
-    position: absolute;
-    filter: drop-shadow(0 0 0.5vw rgba(0, 0, 0, 0.5));
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.legend-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
 }

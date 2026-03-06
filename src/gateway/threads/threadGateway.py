@@ -95,6 +95,10 @@ class threadGateway(ThreadWithStop):
         """This functin will send the message on all the pipes that are in the sending list of the message ID.
         Args:
             message(dictionary): Dictionary received from the multiprocessing queues ( the config one).
+
+        If a subscriber's pipe is full (its process is busy), the frame is
+        dropped for that subscriber instead of blocking the gateway and
+        stalling all other message routing.
         """
 
         Owner = message["Owner"]
@@ -102,13 +106,26 @@ class threadGateway(ThreadWithStop):
         Type = message["msgType"]
         Value = message["msgValue"]
         if (Owner, Id) in self.messageApproved:
-            for element in self.sendingList[Owner][Id]:
-                # We send a dictionary that contain the type of the message and message
-                self.sendingList[Owner][Id][element].send(
-                    {"Type": Type, "value": Value, "id": Id, "Owner": Owner}
-                )
+            dead_keys = []
+            for element in list(self.sendingList[Owner][Id]):
+                pipe = self.sendingList[Owner][Id][element]
+                try:
+                    pipe.send(
+                        {"Type": Type, "value": Value, "id": Id, "Owner": Owner}
+                    )
+                except (BrokenPipeError, OSError):
+                    # Subscriber process has died; mark for cleanup
+                    dead_keys.append(element)
                 if self.debugging:
                     self.logger.warning(message)
+            # Clean up dead subscribers
+            for key in dead_keys:
+                del self.sendingList[Owner][Id][key]
+                if (Owner, Id) in self.messageApproved:
+                    try:
+                        self.messageApproved.remove((Owner, Id))
+                    except ValueError:
+                        pass
 
     # ====================================================================================
 

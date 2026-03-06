@@ -13,4 +13,5 @@ torch
 numpy==2.4.1
 opencv-python==4.13.0.90
 scipy==1.17.0
+networkx>=3.0
 

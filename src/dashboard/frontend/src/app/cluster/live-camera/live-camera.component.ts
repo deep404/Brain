@@ -26,6 +26,7 @@ export class LiveCameraComponent {
 
   private tsMaskSubscription: Subscription | undefined;
   private laneMaskSubscription: Subscription | undefined;
+  private resetSubscription: Subscription | undefined;
 
   private tsMaskTimeout: any;
   private laneMaskTimeout: any;
@@ -81,12 +82,22 @@ export class LiveCameraComponent {
       },
       () => { this.laneAssistMask = undefined; }
     );
+
+    // Dashboard reset: clear overlays and show black frame
+    this.resetSubscription = this.webSocketService.dashboardReset$.subscribe(() => {
+      this.trafficSignMask = undefined;
+      this.laneAssistMask = undefined;
+      this.loading = true;
+      this.defaultImg = undefined;
+      this.image = this.createBlackImage();
+    });
   }
 
   ngOnDestroy() {
     this.cameraSubscription?.unsubscribe();
     this.tsMaskSubscription?.unsubscribe();
     this.laneMaskSubscription?.unsubscribe();
+    this.resetSubscription?.unsubscribe();
     if (this.tsMaskTimeout) clearTimeout(this.tsMaskTimeout);
     if (this.laneMaskTimeout) clearTimeout(this.laneMaskTimeout);
     if (this.loadingTimeout) clearTimeout(this.loadingTimeout);

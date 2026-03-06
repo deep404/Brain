@@ -18,6 +18,7 @@ export class ConsoleComponent implements OnInit, OnDestroy, OnChanges {
 
     logs: SafeHtml[] = [];
     private logSubscription: Subscription | undefined;
+    private resetSubscription: Subscription | undefined;
 
     constructor(private webSocketService: WebSocketService, private sanitizer: DomSanitizer) { }
 
@@ -26,6 +27,10 @@ export class ConsoleComponent implements OnInit, OnDestroy, OnChanges {
             if (response && response.data) {
                 this.addLog(response.data);
             }
+        });
+
+        this.resetSubscription = this.webSocketService.dashboardReset$.subscribe(() => {
+            this.clearConsole();
         });
     }
 
@@ -46,6 +51,9 @@ export class ConsoleComponent implements OnInit, OnDestroy, OnChanges {
         document.body.style.overflow = '';
         if (this.logSubscription) {
             this.logSubscription.unsubscribe();
+        }
+        if (this.resetSubscription) {
+            this.resetSubscription.unsubscribe();
         }
     }
 

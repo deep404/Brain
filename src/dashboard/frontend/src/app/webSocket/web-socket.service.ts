@@ -38,6 +38,10 @@ export class WebSocketService {
   connectionStatus$ = this.connectionStatusSubject.asObservable();
 
   private eventSubject = new Subject<{ channel: string, data: any }>();
+
+  /** Fires immediately when a dashboard reset is requested (client-side). */
+  private resetSubject = new Subject<void>();
+  dashboardReset$ = this.resetSubject.asObservable();
   private handledEvents = new Set([
     'heartbeat',
     'heartbeat_disconnect',
@@ -71,7 +75,13 @@ export class WebSocketService {
       // overlays / debug channels
     'TrafficSignCamera',
     'TrafficSignMask',
-    'LaneAssistMask',  
+    'LaneAssistMask',
+
+    // route planning channels
+    'RoutePlanData',
+    'CarMapPosition',
+    'TrafficSignDetected',
+    'MapGraphData',
   ]);
 
   constructor() {
@@ -247,6 +257,37 @@ export class WebSocketService {
 
   receiveConsoleLog(): Observable<any> {
     return this.webSocket.fromEvent('console_log');
+  }
+
+  // Route planning channels
+  receiveRoutePlanData(): Observable<any> {
+    return this.webSocket.fromEvent('RoutePlanData');
+  }
+
+  receiveCarMapPosition(): Observable<any> {
+    return this.webSocket.fromEvent('CarMapPosition');
+  }
+
+  receiveTrafficSignDetected(): Observable<any> {
+    return this.webSocket.fromEvent('TrafficSignDetected');
+  }
+
+  receiveMapGraphData(): Observable<any> {
+    return this.webSocket.fromEvent('MapGraphData');
+  }
+
+  receiveDashboardReset(): Observable<any> {
+    return this.webSocket.fromEvent('DashboardReset');
+  }
+
+  /** Send DashboardReset to backend AND publish locally so components reset immediately. */
+  requestDashboardReset(): void {
+    this.sendMessageToFlask(JSON.stringify({ Name: 'DashboardReset' }));
+    this.resetSubject.next();
+  }
+
+  requestMapGraphData(): void {
+    this.sendMessageToFlask(JSON.stringify({ Name: 'GetMapGraphData' }));
   }
 
   // Method to receive the initial connection confirmation

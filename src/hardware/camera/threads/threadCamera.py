@@ -1,10 +1,7 @@
 import cv2
+import os
 import threading
 import base64
-try:
-    import picamera2
-except Exception:
-    picamera2 = None
 import time
 
 from src.utils.messages.allMessages import (
@@ -14,6 +11,7 @@ from src.utils.messages.allMessages import (
     Record,
     Brightness,
     Contrast,
+    CameraReset,
 )
 from src.utils.messages.messageHandlerSender import messageHandlerSender
 from src.utils.messages.messageHandlerSubscriber import messageHandlerSubscriber
@@ -25,10 +23,11 @@ from src.statemachine.systemMode import SystemMode
 class threadCamera(ThreadWithStop):
     """
     Camera thread that can stream either:
-      - Live Raspberry Pi camera (picamera2)  OR
+      - Live USB camera (OpenCV VideoCapture, auto-detected)  OR
       - A recorded MP4 in infinite loop (OpenCV VideoCapture)
 
-    It still publishes mainCamera + serialCamera so all other components keep working unchanged.
+    Publishes mainCamera + serialCamera so all other components keep
+    working unchanged.
     """
 
     def __init__(
@@ -39,10 +38,12 @@ class threadCamera(ThreadWithStop):
         use_live_camera: bool = True,
         video_path: str = "raw_data/bfmc2020_online_2.mp4",
         loop_video: bool = True,
-        target_fps: float = 20.0,   # throttle to reduce CPU
+        target_fps: float = 0.0,   # 0 = max speed, no throttle
     ):
-        pause = 1.0 / max(1.0, float(target_fps))
-        super(threadCamera, self).__init__(pause=pause)
+        # No pause: camera runs as fast as possible.
+        # For live camera, capture rate is limited by the hardware itself.
+        # For video, frames are read at maximum throughput.
+        super(threadCamera, self).__init__(pause=0.0)
 
         self.queuesList = queuesList
         self.logger = logger
@@ -56,11 +57,18 @@ class threadCamera(ThreadWithStop):
         self.frame_rate = 5
         self.recording = False
 
-        self.video_writer = None  # was "" -> causes release() issues
-        self.camera = None
-        self.cap = None  # cv2.VideoCapture for mp4 mode
+        self.video_writer = None
+        self.cap = None             # cv2.VideoCapture for USB camera or video file
+        self._is_live_cap = False   # True when cap is a live USB camera
+        self._cam_index = -1        # device index for auto-reconnect
 
-        # For video mode brightness/contrast (to mimic UI sliders)
+        # Background reader thread state (live camera only)
+        self._reader_thread = None
+        self._reader_lock = threading.Lock()
+        self._latest_frame = None   # most recent frame from reader
+        self._reader_running = False
+
+        # For brightness/contrast sliders
         self._brightness = 0.5  # 0..1, treat 0.5 as neutral
         self._contrast = 16.0   # 0..32, treat 16 as neutral
 
@@ -78,6 +86,7 @@ class threadCamera(ThreadWithStop):
         self.brightnessSubscriber = messageHandlerSubscriber(self.queuesList, Brightness, "lastOnly", True)
         self.contrastSubscriber = messageHandlerSubscriber(self.queuesList, Contrast, "lastOnly", True)
         self.stateChangeSubscriber = messageHandlerSubscriber(self.queuesList, StateChange, "lastOnly", True)
+        self.resetSubscriber = messageHandlerSubscriber(self.queuesList, CameraReset, "lastOnly", True)
 
     def queue_sending(self):
         if self._blocker.is_set():
@@ -88,36 +97,163 @@ class threadCamera(ThreadWithStop):
     # -------------------- source init --------------------
     def _init_source(self):
         if self.use_live_camera:
-            self._init_camera()
+            self._init_live_camera()
         else:
             self._init_video()
 
-    def _init_camera(self):
-        if picamera2 is None:
-            print("[ Camera Thread] INFO - picamera2/libcamera not available; camera disabled.")
-            self.camera = None
-            return
+    def _init_live_camera(self):
+        """
+        Auto-detect and open the first available USB camera, then start
+        a background reader thread that continuously calls cap.read().
 
-        try:
-            if len(picamera2.Picamera2.global_camera_info()) == 0:
-                print(f"\033[1;97m[ Camera Thread ] :\033[0m \033[1;91mERROR\033[0m - No camera detected. Camera functionality will be disabled.")
-                self.camera = None
+        The reader absorbs V4L2 select() timeouts (~10 s each on WSL2)
+        so the main thread_work() never blocks.  Between timeouts the
+        reader stores fresh frames at full camera FPS.
+        """
+        self._is_live_cap = False
+
+        # Find candidate device indices from /dev/video*
+        candidates = []
+        for i in range(10):
+            if os.path.exists(f"/dev/video{i}"):
+                candidates.append(i)
+        if not candidates:
+            candidates = list(range(5))
+
+        print(
+            f"\033[1;97m[ Camera Thread ] :\033[0m \033[1;96mINFO\033[0m - "
+            f"Searching for USB camera (candidates: {candidates})..."
+        )
+
+        for idx in candidates:
+            cap = self._try_open_device(idx)
+            if cap is not None:
+                self.cap = cap
+                self._is_live_cap = True
+                self._cam_index = idx
+
+                actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+                print(
+                    f"\033[1;97m[ Camera Thread ] :\033[0m \033[1;92mINFO\033[0m - "
+                    f"USB camera opened at /dev/video{idx} "
+                    f"({actual_w}x{actual_h} @ {actual_fps:.0f}fps)"
+                )
+
+                # Start background reader
+                self._start_reader()
                 return
 
-            self.camera = picamera2.Picamera2()
-            config = self.camera.create_preview_configuration(
-                buffer_count=1,
-                queue=False,
-                main={"format": "RGB888", "size": (2048, 1080)},
-                lores={"size": (512, 270)},
-                encode="lores",
+        # Nothing worked
+        is_wsl = self._is_wsl()
+        err = (
+            f"\033[1;97m[ Camera Thread ] :\033[0m \033[1;91mERROR\033[0m - "
+            f"No USB camera found (tried {candidates}). Camera disabled."
+        )
+        if is_wsl:
+            err += (
+                "\n\033[1;93m  WSL2 detected — USB devices need usbipd-win:\033[0m"
+                "\n\033[1;93m    (admin PowerShell) usbipd list\033[0m"
+                "\n\033[1;93m    (admin PowerShell) usbipd bind --busid <BUS>  &&  usbipd attach --wsl --busid <BUS>\033[0m"
+                "\n\033[1;93m    (WSL)  sudo apt install linux-tools-virtual hwdata  &&  ls /dev/video*\033[0m"
             )
-            self.camera.configure(config)  # type: ignore
-            self.camera.start()
-            print(f"\033[1;97m[ Camera Thread ] :\033[0m \033[1;92mINFO\033[0m - Camera initialized successfully")
-        except Exception as e:
-            print(f"\033[1;97m[ Camera Thread ] :\033[0m \033[1;91mERROR\033[0m - Failed to initialize camera: {e}")
-            self.camera = None
+        print(err)
+
+    # ---- background reader ------------------------------------------------
+    def _start_reader(self):
+        """Launch daemon thread that continuously grabs frames from cap."""
+        self._reader_running = True
+        self._latest_frame = None
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="CameraReader"
+        )
+        self._reader_thread.start()
+
+    def _stop_reader(self):
+        self._reader_running = False
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=12)  # slightly above V4L2 timeout
+            self._reader_thread = None
+
+    def _reader_loop(self):
+        """
+        Continuously read frames.  V4L2 select() timeouts block this
+        thread for ~10 s but do NOT block the main thread.
+        After a timeout, the next read usually succeeds immediately.
+        """
+        consecutive_fails = 0
+        while self._reader_running and self.cap is not None:
+            try:
+                ok, frame = self.cap.read()
+            except Exception:
+                ok, frame = False, None
+
+            if ok and frame is not None:
+                with self._reader_lock:
+                    self._latest_frame = frame
+                consecutive_fails = 0
+            else:
+                consecutive_fails += 1
+                if consecutive_fails >= 10:
+                    # Camera is truly gone — try to reopen
+                    print(
+                        "\033[1;97m[ Camera Thread ] :\033[0m \033[1;93mWARNING\033[0m - "
+                        f"{consecutive_fails} consecutive read failures, "
+                        f"reopening /dev/video{self._cam_index}..."
+                    )
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    time.sleep(2.0)
+                    cap = self._try_open_device(self._cam_index)
+                    if cap is not None:
+                        self.cap = cap
+                        consecutive_fails = 0
+                        print(
+                            "\033[1;97m[ Camera Thread ] :\033[0m \033[1;92mINFO\033[0m - "
+                            "Camera reconnected successfully"
+                        )
+                    else:
+                        print(
+                            "\033[1;97m[ Camera Thread ] :\033[0m \033[1;91mERROR\033[0m - "
+                            "Camera reconnect failed. Stopping reader."
+                        )
+                        self._reader_running = False
+
+    # ---- open helper (no blocking warmup reads) ----------------------------
+    @staticmethod
+    def _try_open_device(idx):
+        """
+        Try to open a camera device at the given index.
+        Sets MJPG fourcc and buffer size 1 for compatibility.
+        Does NOT attempt a blocking read (the reader thread handles that).
+        Returns the cv2.VideoCapture if opened, else None.
+        """
+        for backend in [cv2.CAP_V4L2, cv2.CAP_ANY]:
+            try:
+                cap = cv2.VideoCapture(idx, backend)
+                if not cap.isOpened():
+                    continue
+
+                # MJPG is broadly supported and avoids raw-format issues
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+                return cap
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _is_wsl():
+        try:
+            with open("/proc/version", "r") as f:
+                return "microsoft" in f.read().lower()
+        except Exception:
+            return False
 
     def _init_video(self):
         self.cap = cv2.VideoCapture(self.video_path)  # OpenCV reads video files via VideoCapture() :contentReference[oaicite:0]{index=0}
@@ -126,7 +262,16 @@ class threadCamera(ThreadWithStop):
             self.cap = None
             return
 
-        print(f"\033[1;97m[ Camera Thread ] :\033[0m \033[1;92mINFO\033[0m - Video mode initialized: {self.video_path}")
+        # Pace video playback to its native FPS so we don't flood the pipe
+        native_fps = self.cap.get(cv2.CAP_PROP_FPS), 30.0
+        self._video_fps = native_fps[0] if native_fps[0] > 0 else native_fps[1]
+        self._video_frame_delay = 1.0 / self._video_fps
+        self._last_video_frame_t = 0.0
+
+        print(
+            f"\033[1;97m[ Camera Thread ] :\033[0m \033[1;92mINFO\033[0m - "
+            f"Video mode initialized ({self._video_fps:.1f} fps): {self.video_path}"
+        )
 
     # -------------------- video processing helpers --------------------
     def _apply_brightness_contrast(self, img_bgr):
@@ -137,6 +282,19 @@ class threadCamera(ThreadWithStop):
 
     # ================================ RUN ================================================
     def thread_work(self):
+        # --- camera reset (seek video to frame 0, only for pre-recorded) ---
+        try:
+            resetRecv = self.resetSubscriber.receive()
+            if resetRecv is not None and self.cap is not None and not self._is_live_cap:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                self._last_video_frame_t = 0.0
+                print(
+                    "\033[1;97m[ Camera Thread ] :\033[0m \033[1;92mINFO\033[0m - "
+                    "Video reset to frame 0 (dashboard reset)"
+                )
+        except Exception:
+            pass
+
         # --- recording toggle ---
         try:
             recordRecv = self.recordSubscriber.receive()
@@ -160,36 +318,42 @@ class threadCamera(ThreadWithStop):
 
         # --- get frame from selected source ---
         try:
-            if self.use_live_camera:
-                if self.camera is None:
-                    time.sleep(0.1)
+            if self.cap is None:
+                time.sleep(0.1)
+                return
+
+            if self._is_live_cap:
+                # ── Live USB camera — grab latest frame from reader ──────
+                with self._reader_lock:
+                    frame = self._latest_frame
+                    self._latest_frame = None  # consume it
+
+                if frame is None:
+                    # Reader hasn't produced a frame yet (warmup or timeout)
+                    time.sleep(0.03)
                     return
 
-                mainRequest = self.camera.capture_array("main")
-                serialRequest = self.camera.capture_array("lores")
-                serialRequest = cv2.cvtColor(serialRequest, cv2.COLOR_YUV2BGR_I420)
+                mainRequest = cv2.resize(frame, (2048, 1080), interpolation=cv2.INTER_AREA)
+                serialRequest = cv2.resize(frame, (512, 270), interpolation=cv2.INTER_AREA)
 
             else:
-                if self.cap is None:
-                    time.sleep(0.1)
-                    return
+                # ── Pre-recorded video ───────────────────────────────────
+                now = time.time()
+                elapsed = now - self._last_video_frame_t
+                if elapsed < self._video_frame_delay:
+                    time.sleep(self._video_frame_delay - elapsed)
+                self._last_video_frame_t = time.time()
 
                 ok, frame = self.cap.read()
                 if not ok:
-                    # loop forever by rewinding to frame 0 (CAP_PROP_POS_FRAMES is next frame index) :contentReference[oaicite:2]{index=2}
                     if self.loop_video:
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # :contentReference[oaicite:3]{index=3}
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         ok, frame = self.cap.read()
-
                 if not ok:
                     time.sleep(0.05)
                     return
 
-                # apply slider-like settings in video mode
                 frame = self._apply_brightness_contrast(frame)
-
-                # match BFMC sizes
-                # main stream should be 2048x1080, serial should be 512x270
                 mainRequest = cv2.resize(frame, (2048, 1080), interpolation=cv2.INTER_AREA)
                 serialRequest = cv2.resize(frame, (512, 270), interpolation=cv2.INTER_AREA)
 
@@ -223,6 +387,9 @@ class threadCamera(ThreadWithStop):
 
     # =============================== STOP ================================================
     def stop(self):
+        # Stop background reader first (so it doesn't use cap after release)
+        self._stop_reader()
+
         if self.video_writer is not None:
             self.video_writer.release()
             self.video_writer = None
@@ -230,13 +397,6 @@ class threadCamera(ThreadWithStop):
         if self.cap is not None:
             self.cap.release()
             self.cap = None
-
-        if self.camera is not None:
-            try:
-                self.camera.stop()
-            except Exception:
-                pass
-            self.camera = None
 
         super(threadCamera, self).stop()
 
@@ -249,26 +409,12 @@ class threadCamera(ThreadWithStop):
         if self.brightnessSubscriber.is_data_in_pipe():
             message = self.brightnessSubscriber.receive()
             val = max(0.0, min(1.0, float(message)))
-
-            if self.use_live_camera:
-                if self.camera is not None:
-                    self.camera.set_controls(
-                        {"AeEnable": False, "AwbEnable": False, "Brightness": val}
-                    )
-            else:
-                self._brightness = val
+            self._brightness = val
 
         # Contrast
         if self.contrastSubscriber.is_data_in_pipe():
             message = self.contrastSubscriber.receive()
             val = max(0.0, min(32.0, float(message)))
-
-            if self.use_live_camera:
-                if self.camera is not None:
-                    self.camera.set_controls(
-                        {"AeEnable": False, "AwbEnable": False, "Contrast": val}
-                    )
-            else:
-                self._contrast = val
+            self._contrast = val
 
         threading.Timer(1, self.configs).start()

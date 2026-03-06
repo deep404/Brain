@@ -11,7 +11,8 @@ from src.templates.threadwithstop import ThreadWithStop
 from src.utils.messages import allMessages
 from src.utils.messages.messageHandlerSubscriber import messageHandlerSubscriber
 from src.utils.messages.messageHandlerSender import messageHandlerSender
-from src.utils.messages.allMessages import TrafficSignMask
+from src.utils.messages.allMessages import TrafficSignMask, TrafficSignEvent
+from src.utils.config import cfg
 
 
 class threadTrafficSignDetection(ThreadWithStop):
@@ -26,7 +27,7 @@ class threadTrafficSignDetection(ThreadWithStop):
         imgsz=640,
         dashboard_size=(512, 270),
     ):
-        super().__init__(pause=0.01)
+        super().__init__(pause=0.001)  # 1ms cooperative yield; prevents CPU spin
         self.queuesList = queuesList
         self.logger = logger
 
@@ -35,9 +36,12 @@ class threadTrafficSignDetection(ThreadWithStop):
         self.weights_path = weights_path or os.environ.get("BFMC_TSD_WEIGHTS", "")
         self.input_message_name = input_message
 
-        # inference rate only (video stays smooth via serialCamera pipeline)
-        self.target_fps = max(0.05, float(target_fps))
-        self.min_period_s = 1.0 / self.target_fps
+        # target_fps <= 0 means "process every available frame" (no rate limit)
+        self.target_fps = float(target_fps)
+        if self.target_fps > 0:
+            self.min_period_s = 1.0 / self.target_fps
+        else:
+            self.min_period_s = 0.0
 
         self.conf = float(conf)
         self.imgsz = int(imgsz)
@@ -50,6 +54,7 @@ class threadTrafficSignDetection(ThreadWithStop):
 
         # Send PNG overlay mask to dashboard
         self.mask_sender = messageHandlerSender(self.queuesList, TrafficSignMask)
+        self.sign_event_sender = messageHandlerSender(self.queuesList, TrafficSignEvent)
 
         self._last_infer_t = 0.0
         self._model = None
@@ -106,10 +111,10 @@ class threadTrafficSignDetection(ThreadWithStop):
         return self._encode_b64_png_rgba(rgba)
 
     def _dash_log(self, level: str, msg: str):
-        q = self.queuesList.get("Log", None)
-        if q is None:
-            return
-
+        """Log to both terminal and frontend console.
+        print() goes through MultiWriter → stdout + Log queue.
+        stream_console_logs picks up from Log queue → emits to frontend.
+        """
         level = (level or "INFO").upper()
         level_color = {
             "INFO": "\033[1;92mINFO\033[0m",
@@ -119,7 +124,7 @@ class threadTrafficSignDetection(ThreadWithStop):
         }.get(level, level)
 
         prefix = "\033[1;97m[ TrafficSignDetection ] :\033[0m"
-        q.put(f"{prefix} {level_color} - {msg}")
+        print(f"{prefix} {level_color} - {msg}", flush=True)
 
     def _log_detections(self, det_strings):
         if not det_strings:
@@ -144,14 +149,35 @@ class threadTrafficSignDetection(ThreadWithStop):
             y2 = int(max(0, min(self.dashboard_h - 1, y2 * sy)))
 
             cv2.rectangle(bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            label_text = f"{lab} {cf:.0%}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            thickness = 2
+            (tw, th), baseline = cv2.getTextSize(label_text, font, font_scale, thickness)
+
+            # Place text above the box if there's room, otherwise inside
+            if y1 - th - 6 >= 0:
+                # Enough room above: draw background + text above box
+                text_y = y1 - 6
+                bg_y1 = y1 - th - 8
+                bg_y2 = y1 - 2
+            else:
+                # Not enough room above: draw inside the box
+                text_y = y1 + th + 4
+                bg_y1 = y1 + 2
+                bg_y2 = y1 + th + 8
+
+            # Semi-transparent background for readability
+            cv2.rectangle(bgr, (x1, bg_y1), (x1 + tw + 6, bg_y2), (0, 80, 0), -1)
             cv2.putText(
                 bgr,
-                f"{lab} {cf:.2f}",
-                (x1, max(15, y1 - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                label_text,
+                (x1 + 3, text_y),
+                font,
+                font_scale,
                 (0, 255, 0),
-                2,
+                thickness,
                 cv2.LINE_AA,
             )
 
@@ -180,9 +206,21 @@ class threadTrafficSignDetection(ThreadWithStop):
             if frame is None:
                 return
 
-            # Inference
+            full_h, full_w = frame.shape[:2]
+
+            # ── Crop frame to near-field ROI ─────────────────────────────
+            roi_y1 = int(full_h * cfg.ROI_Y_START)
+            roi_y2 = int(full_h * cfg.ROI_Y_END)
+            roi_x1 = int(full_w * cfg.ROI_X_START)
+            roi_x2 = int(full_w * cfg.ROI_X_END)
+
+            frame_roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+            if frame_roi.size == 0:
+                return
+
+            # Inference on ROI only (nearby objects appear large)
             results = self._model.predict(
-                source=frame,
+                source=frame_roi,
                 conf=self.conf,
                 imgsz=self.imgsz,
                 verbose=False,
@@ -195,8 +233,6 @@ class threadTrafficSignDetection(ThreadWithStop):
             det_strings = []
 
             if boxes is None or len(boxes) == 0:
-                # send blank mask to clear overlay
-                self._log_detections([])
                 self.mask_sender.send(self._blank_mask_b64())
                 self._last_infer_t = now
                 return
@@ -208,23 +244,44 @@ class threadTrafficSignDetection(ThreadWithStop):
 
             labels = []
             conf_list = []
-            xyxy_list = []
+            xyxy_roi = []       # boxes in ROI-cropped coordinates
+            xyxy_full = []      # boxes offset back to full-frame coordinates
             for c, p, (x1, y1, x2, y2) in zip(cls_ids, confs, xyxy):
                 label = names.get(int(c), str(int(c)))
                 labels.append(label)
                 conf_list.append(float(p))
-                xyxy_list.append((float(x1), float(y1), float(x2), float(y2)))
-                det_strings.append(f"{label}:{p:.2f}@[{int(x1)},{int(y1)},{int(x2)},{int(y2)}]")
+                xyxy_roi.append((float(x1), float(y1), float(x2), float(y2)))
+                # Offset back to full-frame coordinates for the mask overlay
+                xyxy_full.append((
+                    float(x1) + roi_x1,
+                    float(y1) + roi_y1,
+                    float(x2) + roi_x1,
+                    float(y2) + roi_y1,
+                ))
+                det_strings.append(f"{label}:{p:.2f}@[{int(x1+roi_x1)},{int(y1+roi_y1)},{int(x2+roi_x1)},{int(y2+roi_y1)}]")
 
-            self._log_detections(det_strings)
+            # Emit structured detection events with FULL-FRAME coordinates
+            # so the dashboard ROI ratio calculation uses the correct frame area.
+            if labels:
+                self.sign_event_sender.send({
+                    "detections": [
+                        {
+                            "label": lab,
+                            "confidence": float(cf),
+                            "bbox": list(box_full),
+                        }
+                        for lab, cf, box_full in zip(labels, conf_list, xyxy_full)
+                    ],
+                    "frame_w": full_w,
+                    "frame_h": full_h,
+                    "timestamp": now,
+                })
 
-            # r.orig_shape is (h, w)
-            orig_h, orig_w = getattr(r, "orig_shape", frame.shape[:2])
-
+            # Build mask at FULL-FRAME size using offset bounding boxes
             mask_b64 = self._build_mask_from_boxes(
-                orig_w=orig_w,
-                orig_h=orig_h,
-                boxes_xyxy=xyxy_list,
+                orig_w=full_w,
+                orig_h=full_h,
+                boxes_xyxy=xyxy_full,
                 labels=labels,
                 confs=conf_list,
             )

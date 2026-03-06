@@ -222,6 +222,36 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
   height: 24px;
 }
 
+/* Dashboard reset button anchored below console toggle */
+.dashboard-reset {
+  position: absolute;
+  top: 60px;
+  left: 10px;
+  background: none;
+  border: none;
+  color: white;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  cursor: pointer;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+}
+
+.dashboard-reset:hover {
+  color: #ff5555;
+  transform: rotate(-90deg) scale(1.1);
+}
+
+.dashboard-reset svg {
+  fill: currentColor;
+  width: 24px;
+  height: 24px;
+}
+
 /* Settings modal removed; handled by SettingsComponent */
 
 .modal {

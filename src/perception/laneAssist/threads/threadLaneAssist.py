@@ -9,9 +9,10 @@ import numpy as np
 
 from src.templates.threadwithstop import ThreadWithStop
 from src.utils.messages import allMessages
-from src.utils.messages.allMessages import LaneAssistMask
+from src.utils.messages.allMessages import LaneAssistMask, StopLineEvent
 from src.utils.messages.messageHandlerSubscriber import messageHandlerSubscriber
 from src.utils.messages.messageHandlerSender import messageHandlerSender
+from src.utils.config import cfg
 
 
 class threadLaneAssist(ThreadWithStop):
@@ -31,14 +32,18 @@ class threadLaneAssist(ThreadWithStop):
         camera_type: str = "455",
         dashboard_size: Tuple[int, int] = (512, 270),
     ):
-        super().__init__(pause=0.01)
+        super().__init__(pause=0.001)  # 1ms cooperative yield; prevents CPU spin
 
         self.queuesList = queuesList
         self.logger = logger
 
         self.input_message_name = input_message
-        self.target_fps = max(0.05, float(target_fps))
-        self.min_period_s = 1.0 / self.target_fps
+        self.target_fps = float(target_fps)
+        # target_fps <= 0 means "process every available frame" (no rate limit)
+        if self.target_fps > 0:
+            self.min_period_s = 1.0 / self.target_fps
+        else:
+            self.min_period_s = 0.0
         self.camera_type = str(camera_type)
 
         self.dashboard_w, self.dashboard_h = int(dashboard_size[0]), int(dashboard_size[1])
@@ -47,10 +52,13 @@ class threadLaneAssist(ThreadWithStop):
         self.frame_sub = messageHandlerSubscriber(self.queuesList, input_enum, "lastOnly", True)
 
         self.mask_sender = messageHandlerSender(self.queuesList, LaneAssistMask)
+        self.stop_line_sender = messageHandlerSender(self.queuesList, StopLineEvent)
 
         self._last_run_t = 0.0
         self._lk = None
         self._ld = None
+        self._stop_line_consec = 0        # consecutive frames with stop_line & dist>0.8
+        self._stop_line_confirmed = False  # already sent event for current stop line
 
         self._dash_log(
             "INFO",
@@ -60,9 +68,10 @@ class threadLaneAssist(ThreadWithStop):
     # ----------------------- helpers -----------------------
 
     def _dash_log(self, level: str, msg: str):
-        q = self.queuesList.get("Log", None)
-        if q is None:
-            return
+        """Log to both terminal and frontend console.
+        print() goes through MultiWriter → stdout + Log queue.
+        stream_console_logs picks up from Log queue → emits to frontend.
+        """
         level = (level or "INFO").upper()
         level_color = {
             "INFO": "\033[1;92mINFO\033[0m",
@@ -71,13 +80,23 @@ class threadLaneAssist(ThreadWithStop):
             "DEBUG": "\033[1;94mDEBUG\033[0m",
         }.get(level, level)
         prefix = "\033[1;97m[ LaneAssist ] :\033[0m"
-        q.put(f"{prefix} {level_color} - {msg}")
+        print(f"{prefix} {level_color} - {msg}", flush=True)
 
     def _decode_b64_jpeg(self, b64_str: str) -> Optional[np.ndarray]:
         try:
             img_bytes = base64.b64decode(b64_str)
             arr = np.frombuffer(img_bytes, dtype=np.uint8)
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            return img
+        except Exception:
+            return None
+
+    def _decode_b64_png_rgba(self, b64_str: str) -> Optional[np.ndarray]:
+        """Decode a base64-encoded PNG (with alpha) back to an RGBA numpy array."""
+        try:
+            img_bytes = base64.b64decode(b64_str)
+            arr = np.frombuffer(img_bytes, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)  # preserves alpha
             return img
         except Exception:
             return None
@@ -107,16 +126,19 @@ class threadLaneAssist(ThreadWithStop):
 
         self._dash_log("INFO", f"LaneAssist models created for {width}x{height} camera={self.camera_type}")
 
-    def _build_lane_mask(self, lane_det_results: dict) -> str:
+    def _build_lane_mask(self, lane_det_results: dict, mask_h: int = None, mask_w: int = None) -> str:
         """
         Build an RGBA PNG overlay mask using the SAME HUD-style visualization
         methods from LaneDetection + LaneKeeping (like your screenshot).
 
         - zone layer: filled polygon between lanes (low alpha)
         - lines layer: neon lanes, peak dots, desired lane, stop line + HUD (high alpha)
+
+        mask_h/mask_w: override dimensions (e.g. ROI size).  Defaults to dashboard size.
         """
 
-        h, w = self.dashboard_h, self.dashboard_w
+        h = mask_h or self.dashboard_h
+        w = mask_w or self.dashboard_w
 
         # Layers
         zone = np.zeros((h, w, 3), dtype=np.uint8)
@@ -258,10 +280,24 @@ class threadLaneAssist(ThreadWithStop):
         if frame.shape[1] != self.dashboard_w or frame.shape[0] != self.dashboard_h:
             frame = cv2.resize(frame, (self.dashboard_w, self.dashboard_h), interpolation=cv2.INTER_AREA)
 
-        self._ensure_models(width=self.dashboard_w, height=self.dashboard_h)
+        full_h, full_w = frame.shape[:2]
+
+        # ── Crop frame to near-field ROI ─────────────────────────────────
+        roi_y1 = int(full_h * cfg.ROI_Y_START)
+        roi_y2 = int(full_h * cfg.ROI_Y_END)
+        roi_x1 = int(full_w * cfg.ROI_X_START)
+        roi_x2 = int(full_w * cfg.ROI_X_END)
+
+        frame_roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+        if frame_roi.size == 0:
+            return
+
+        roi_h, roi_w = frame_roi.shape[:2]
+
+        self._ensure_models(width=roi_w, height=roi_h)
 
         try:
-            results = self._ld.lanes_detection(frame.copy())
+            results = self._ld.lanes_detection(frame_roi.copy())
             angle, _ = self._lk.lane_keeping(results)
 
             dashed_left = results.get("dashed_left")
@@ -269,13 +305,40 @@ class threadLaneAssist(ThreadWithStop):
             stop_line = results.get("stop_line_detected")
             dist = results.get("stop_line_distance")
 
-            self._dash_log(
-                "INFO",
-                f"angle={angle:.2f} deg | dashed(L,R)=({dashed_left},{dashed_right}) | stop_line={stop_line} dist={dist}",
-            )
+            # ── 3-consecutive-frame stop line confirmation ───────────────
+            if stop_line and dist is not None and float(dist) > 0.7:
+                self._stop_line_consec += 1
+            else:
+                self._stop_line_consec = 0
+                self._stop_line_confirmed = False
 
-            mask_b64 = self._build_lane_mask(results)
-            self.mask_sender.send(mask_b64)
+            if self._stop_line_consec >= 3 and not self._stop_line_confirmed:
+                self._stop_line_confirmed = True
+                self.stop_line_sender.send({
+                    "detected": True,
+                    "distance": dist,
+                    "timestamp": now,
+                })
+                self._dash_log(
+                    "INFO",
+                    f"Stop line confirmed (3 frames) dist={dist}",
+                )
+
+            # Build mask at ROI size, then embed into full-frame mask
+            roi_mask_b64 = self._build_lane_mask(results, mask_h=roi_h, mask_w=roi_w)
+            if roi_y1 == 0 and roi_x1 == 0 and roi_h == full_h and roi_w == full_w:
+                # ROI is the full frame — no offset needed
+                self.mask_sender.send(roi_mask_b64)
+            else:
+                # Embed ROI mask into full-size transparent mask at the ROI offset
+                roi_rgba = self._decode_b64_png_rgba(roi_mask_b64)
+                if roi_rgba is not None:
+                    full_rgba = np.zeros((full_h, full_w, 4), dtype=np.uint8)
+                    full_rgba[roi_y1:roi_y1 + roi_rgba.shape[0],
+                              roi_x1:roi_x1 + roi_rgba.shape[1]] = roi_rgba
+                    self.mask_sender.send(self._encode_b64_png_rgba(full_rgba))
+                else:
+                    self.mask_sender.send(roi_mask_b64)
 
             self._last_run_t = now
 

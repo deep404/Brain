@@ -312,6 +312,37 @@ class SerialConnectionState(Enum):
     msgID = 3
     msgType = "bool"
 
+################################# From Route Planning ##################################
+class RoutePlanData(Enum):
+    Queue = "General"
+    Owner = "routePlanning"
+    msgID = 1
+    msgType = "dict"
+
+class CarMapPosition(Enum):
+    Queue = "General"
+    Owner = "routePlanning"
+    msgID = 2
+    msgType = "dict"
+
+class StopLineEvent(Enum):
+    Queue = "General"
+    Owner = "laneAssist"
+    msgID = 45
+    msgType = "dict"
+
+class TrafficSignEvent(Enum):
+    Queue = "General"
+    Owner = "trafficSignDetection"
+    msgID = 46
+    msgType = "dict"
+
+class CameraReset(Enum):
+    Queue = "General"
+    Owner = "dashboard"
+    msgID = 47
+    msgType = "dict"
+
 ################################# From StateMachine ##################################
 class StateChange(Enum):
     Queue = "Critical"

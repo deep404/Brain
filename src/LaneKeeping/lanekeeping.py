@@ -549,7 +549,7 @@ class LaneKeeping:
         if left is None and right is None:
             angle = self.last_angle
             error = 0
-            self.log.warning("No lanes found")
+            # self.log.warning("No lanes found")
         else:
             desired_lane = self.desired_lane(left, right)
 
